@@ -9,6 +9,9 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
@@ -49,6 +52,7 @@ jobs:
             git add prices.db
             if ! git diff --cached --quiet; then
               git commit -m "chore: update prices.db [skip ci]"
+              git pull --rebase origin main
               git push
             else
               echo "No changes in prices.db"
