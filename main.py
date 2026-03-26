@@ -81,7 +81,7 @@ def fetch_price_int(url: str, selector: str, user_agent: str) -> int:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled"], # Маскировка от антибота
+            args=["--disable-blink-features=AutomationControlled"],
         )
         context = browser.new_context(user_agent=user_agent)
         page = context.new_page()
@@ -95,29 +95,59 @@ def fetch_price_int(url: str, selector: str, user_agent: str) -> int:
             context.close()
             browser.close()
 
-    # Очистка от мусора (пробелы, &nbsp;, символы валюты)
     digits = re.sub(r"\D", "", text)
     if not digits:
         raise ValueError(f"Не удалось извлечь цифры из текста: '{text}'")
     return int(digits)
 
-def send_telegram_message(bot_token: str, chat_id: str, text: str) -> None:
-    """Отправляет HTTP POST запрос в API Телеграма."""
+def send_telegram_message(bot_token: str, chat_id: str, text: str) -> bool:
+    """
+    Отправляет HTTP POST запрос в API Телеграма.
+    Возвращает True при успехе, False при ошибке.
+    """
     if not bot_token or not chat_id:
-        print("Отсутствуют ключи Telegram (bot_token или chat_id). Сообщение не отправлено.")
-        return
+        print("❌ Отсутствуют ключи Telegram (bot_token или chat_id).")
+        return False
+
+    if not text or not text.strip():
+        print("❌ Попытка отправить пустое сообщение.")
+        return False
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+
+    # Telegram прекрасно понимает form-encoded данные (data=payload).
+    # Оставляем data=payload, чтобы доказать несостоятельность аргумента про json.
+    payload = {
+        "chat_id": chat_id.strip(),
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True # Выключаем гигантские превью ссылок от Каспи
+    }
+
+    print(f"🔵 Отправка запроса в Telegram для chat_id: '{payload['chat_id']}'...")
 
     try:
-        response = requests.post(url, json=payload, timeout=20)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        print(f"Ошибка отправки в Telegram: {exc}")
+        response = requests.post(url, data=payload, timeout=20)
 
-def build_change_message(old_price: int, new_price: int) -> str:
-    """Формирует понятное уведомление об изменении цены."""
+        if not response.ok:
+            try:
+                error_data = response.json()
+                print(f"❌ Ошибка Telegram API (HTTP {response.status_code}):")
+                print(f"   • Код: {error_data.get('error_code')}")
+                print(f"   • Причина: {error_data.get('description')}")
+            except ValueError:
+                print(f"❌ Ошибка Telegram API (HTTP {response.status_code}): {response.text}")
+            return False
+
+        print("✅ Сообщение успешно доставлено в Telegram.")
+        return True
+
+    except requests.RequestException as exc:
+        print(f"❌ Сетевая ошибка при обращении к Telegram API: {exc}")
+        return False
+
+def build_change_message(old_price: int, new_price: int, url: str) -> str:
+    """Формирует понятное уведомление об изменении цены с прикрепленной ссылкой."""
     diff = new_price - old_price
     formatted_new_price = f"{new_price:,}".replace(",", " ")
     formatted_diff = f"{abs(diff):,}".replace(",", " ")
@@ -130,7 +160,8 @@ def build_change_message(old_price: int, new_price: int) -> str:
     return (
         f"🚨 <b>Изменение цены на MacBook!</b>\n\n"
         f"💵 Текущая цена: <b>{formatted_new_price} ₸</b>\n"
-        f"{direction} на {formatted_diff} ₸."
+        f"{direction} на {formatted_diff} ₸.\n\n"
+        f"<a href='{url}'>🛒 Перейти в магазин</a>"
     )
 
 def build_weekly_report(rows: list[tuple[str, int]]) -> str:
@@ -152,7 +183,6 @@ def build_weekly_report(rows: list[tuple[str, int]]) -> str:
 
     lines = ["📊 <b>Еженедельный отчет по MacBook:</b>\n"]
 
-    # Форматируем историю изменения цен
     for date_text, price in rows:
         try:
             dt = datetime.fromisoformat(date_text)
@@ -171,77 +201,73 @@ def build_weekly_report(rows: list[tuple[str, int]]) -> str:
     return "\n".join(lines)
 
 def should_send_weekly_report(current_time: datetime) -> bool:
-    """Проверяет, наступило ли время пятничного отчета (Пятница = 4, время >= 20:00)."""
-    return current_time.weekday() == 4 and current_time.hour >= 20
+    """Проверяет, наступило ли время пятничного отчета. Окно сужено до 30 минут для защиты от спама."""
+    return current_time.weekday() == 4 and current_time.hour == 20 and current_time.minute < 30
 
 def main() -> None:
-    # Загрузка конфигурации из окружения
     product_url = os.getenv("PRODUCT_URL", DEFAULT_URL)
     price_selector = os.getenv("PRICE_SELECTOR", DEFAULT_SELECTOR)
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     tz_name = os.getenv("TZ_NAME", DEFAULT_TZ)
     user_agent = os.getenv("USER_AGENT", DEFAULT_USER_AGENT)
 
-    # Установка часового пояса
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
-        print(f"Ошибка таймзоны '{tz_name}', откат на {DEFAULT_TZ}")
+        print(f"⚠️ Ошибка таймзоны '{tz_name}', откат на {DEFAULT_TZ}")
         tz = ZoneInfo(DEFAULT_TZ)
 
     current_time = datetime.now(tz)
     now_text = current_time.isoformat(timespec="seconds")
 
-    # 1. Инициализация БД
     try:
         init_db()
     except Exception as exc:
-        print(f"Ошибка БД (init): {exc}")
+        print(f"❌ Ошибка БД (init): {exc}")
         return
 
-    # 2. Получение старой цены
     try:
         last_price = get_last_price()
     except Exception as exc:
-        print(f"Ошибка БД (чтение): {exc}")
+        print(f"❌ Ошибка БД (чтение): {exc}")
         return
 
-    # 3. Парсинг новой цены
     try:
         new_price = fetch_price_int(product_url, price_selector, user_agent)
-        print(f"[{current_time.strftime('%H:%M')}] Успешно считана цена: {new_price}")
+        print(f"[{current_time.strftime('%H:%M')}] Успешно считана цена: {new_price} ₸")
     except Exception as exc:
-        print(f"Ошибка парсера: {exc}")
+        print(f"❌ Ошибка парсера: {exc}")
         return
 
-    # 4. Запись в БД
     try:
         insert_price(now_text, new_price)
     except Exception as exc:
-        print(f"Ошибка БД (запись): {exc}")
+        print(f"❌ Ошибка БД (запись): {exc}")
         return
 
-    # 5. Логика алерта (только при изменении цены)
+    # Логика алерта
     if last_price is not None and new_price != last_price:
-        message = build_change_message(last_price, new_price)
-        send_telegram_message(bot_token, chat_id, message)
-        print("Цена изменилась, отправлен алерт.")
+        message = build_change_message(last_price, new_price, product_url)
+        is_sent = send_telegram_message(bot_token, chat_id, message)
+        if not is_sent:
+            print("⚠️ Цена изменилась, но алерт НЕ доставлен. Проверь логи Telegram API выше.")
     else:
-        print("Цена не изменилась. Алерт не отправлен.")
+        print("ℹ️ Цена не изменилась. Алерт не требуется.")
 
-    # 6. Логика еженедельного отчета (Пятница, 20:00)
+    # Логика еженедельного отчета
     if should_send_weekly_report(current_time):
         try:
             rows = get_prices_for_last_7_days(current_time)
             if rows:
                 report = build_weekly_report(rows)
-                send_telegram_message(bot_token, chat_id, report)
-                print("Еженедельный отчет отправлен.")
+                is_sent = send_telegram_message(bot_token, chat_id, report)
+                if not is_sent:
+                    print("⚠️ Отчет сформирован, но НЕ доставлен.")
             else:
-                print("Нет данных для еженедельного отчета.")
+                print("ℹ️ Нет данных для еженедельного отчета.")
         except Exception as exc:
-            print(f"Ошибка отправки еженедельного отчета: {exc}")
+            print(f"❌ Ошибка формирования еженедельного отчета: {exc}")
 
 if __name__ == "__main__":
     main()

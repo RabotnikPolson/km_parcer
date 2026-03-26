@@ -72,3 +72,82 @@ jobs:
 		  fi
 ```
 
+---
+
+## 🐛 ИСПРАВЛЕНИЕ: Диагностика ошибки 400 Telegram API (2026-03-26)
+
+### Найденная проблема
+
+GitHub Actions запустился успешно, скрипт получил цену (454055 тенге), но **не отправил сообщение в Telegram**:
+```
+[15:22] Успешно считана цена: 454055
+Ошибка отправки в Telegram: 400 Client Error: Bad Request
+```
+
+### Корневая причина (по анализу Гемини)
+
+Ошибка **не в формате отправки (JSON vs form-encoded)**, а в **валидации данных и содержимом**. Обнаружены 4 критических уязвимости в `send_telegram_message()`:
+
+### 4 Критических исправления
+
+#### 1️⃣ Валидация chat_id (преобразование в int)
+```python
+# ❌ ДО: может быть строка вместо числа
+payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+
+# ✅ ПОСЛЕ: явное преобразование с обработкой ошибок
+try:
+    chat_id_int = int(chat_id)
+except ValueError:
+    print(f"❌ chat_id некорректен: '{chat_id}'")
+    return
+payload = {"chat_id": chat_id_int, "text": text, "parse_mode": "HTML"}
+```
+
+#### 2️⃣ Проверка на пустое сообщение
+```python
+# ✅ ДОБАВИТЬ перед отправкой
+if not text or not text.strip():
+    print("⚠️ Текст сообщения пуст")
+    return
+```
+
+#### 3️⃣ Полное логирование ошибок от Telegram API
+```python
+# ❌ ДО: только выводим исключение
+except requests.RequestException as exc:
+    print(f"Ошибка: {exc}")
+
+# ✅ ПОСЛЕ: парсим response.json() с полем description
+if not response.ok:
+    try:
+        error_data = response.json()
+        print(f"❌ Telegram API ошибка {response.status_code}:")
+        print(f"   • error_code: {error_data.get('error_code')}")
+        print(f"   • description: {error_data.get('description')}")
+    except ValueError:
+        print(f"❌ Ошибка {response.status_code}: {response.text}")
+    response.raise_for_status()
+```
+
+#### 4️⃣ Добавить логирование размера сообщения
+```python
+# ✅ ДОБАВИТЬ перед отправкой (лимит Telegram - 4096 символов)
+print(f"🔵 Отправка в Telegram ({len(text)} символов, parse_mode=HTML)...")
+```
+
+### План применения
+
+1. Заменить функцию `send_telegram_message()` в `main.py` (строки 104-118)
+2. Добавить валидацию: `int(chat_id)`, `text.strip()`, логирование `response.json()`
+3. Commit: `git add main.py && git commit -m "fix: улучшена валидация Telegram API"`
+4. Push и дождаться следующего запуска GitHub Actions
+5. Проверить логи Actions - теперь будет видна истинная причина ошибки 400
+
+### Ожидаемые результаты
+
+- ✅ Если chat_id валидный → сообщение отправится
+- ✅ Если chat_id невалидный → логи покажут: `❌ chat_id некорректен: 'xxx'`
+- ✅ Если другая ошибка → логи покажут точный `description` от Telegram API
+
+---
