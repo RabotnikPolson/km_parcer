@@ -111,7 +111,7 @@ def send_telegram_message(bot_token: str, chat_id: str, text: str) -> None:
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
 
     try:
-        response = requests.post(url, data=payload, timeout=20)
+        response = requests.post(url, json=payload, timeout=20)
         response.raise_for_status()
     except requests.RequestException as exc:
         print(f"Ошибка отправки в Telegram: {exc}")
